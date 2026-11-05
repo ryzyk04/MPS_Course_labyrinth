@@ -1,4 +1,11 @@
 #include <Arduino.h>
+#include <Wire.h>
+#include "../../shared/puzzle_i2c.h"
+
+// Временная общая I2C-шина через Uno wires: A4=SDA, A5=SCL, адрес 0x12.
+PuzzleI2c bus;
+bool gameActive = false;
+uint32_t solvedAt = 0;
 
 // Лабиринт, уровень 1, на матрице 8x8 (MAX7219) с 4 кнопками
 //
@@ -989,11 +996,13 @@ bool wallBetween(uint8_t x1, uint8_t y1, uint8_t x2, uint8_t y2) {
 }
 
 void tryMove(int8_t dx, int8_t dy) {
+  if (!gameActive) return;
   int8_t nx = px + dx;
   int8_t ny = py + dy;
   bool outside = nx < 0 || nx >= level.size || ny < 0 || ny >= level.size;
 
   if (outside || wallBetween(px, py, nx, ny)) {
+    bus.smallError();
     alertUntil = millis() + ALERT_MS;   // врезались - зажигаем светодиод
   } else {
     px = nx;
@@ -1013,16 +1022,14 @@ void handleKey(int8_t key) {
   Serial.println(py);
 }
 
-// Выбираем случайный лабиринт (не тот же самый, что был) и ставим игрока на старт
+// Один из девяти лабиринтов выбранной сложности, воспроизводимо по сиду.
 void pickLevel() {
-  int8_t next;
-  do {
-    next = random(LEVEL_COUNT);
-  } while (LEVEL_COUNT > 1 && next == levelIndex);
-  levelIndex = next;
+  levelIndex = bus.status.difficulty * 9 + bus.status.seed % 9;
   memcpy_P(&level, &LEVELS[levelIndex], sizeof(Level));
   px = level.startX;
   py = level.startY;
+  gameActive = true;
+  lastKey = -1; keyTime = lastRepeat = millis(); alertUntil = 0;
 
   // светодиоды сложности: 6 - лёгкий, 7 - средний, 8 - сложный
   digitalWrite(PIN_LED_EASY,   level.difficulty == EASY);
@@ -1039,19 +1046,21 @@ void pickLevel() {
 }
 
 void win() {
-  uint8_t full[8] = {255, 255, 255, 255, 255, 255, 255, 255};
-  uint8_t empty[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  for (uint8_t i = 0; i < 4; i++) {
-    showFrame(full);
-    delay(200);
-    showFrame(empty);
-    delay(200);
-  }
-  pickLevel();
+  gameActive = false;
+  solvedAt = millis();
+  bus.solved();
+  Serial.println(F("SOLVED: жду следующую команду игры"));
 }
 
 void draw(uint32_t now) {
   uint8_t frame[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  if (!gameActive) {
+    bool solved = bus.status.state == ModuleBus::SOLVED;
+    if (solved && (now - solvedAt >= 1600 || ((now - solvedAt) / 200) % 2 == 0))
+      memset(frame, 255, sizeof(frame));
+    showFrame(frame);
+    return;
+  }
 
   // стены не рисуем - о них сообщает только светодиод
   // финиш мигает
@@ -1064,7 +1073,6 @@ void draw(uint32_t now) {
 
 void setup() {
   Serial.begin(9600);
-  delay(1500);   // даём монитору порта подключиться после перезагрузки платы
   pinMode(PIN_DIN, OUTPUT);
   pinMode(PIN_CS, OUTPUT);
   pinMode(PIN_CLK, OUTPUT);
@@ -1082,12 +1090,21 @@ void setup() {
   send(REG_INTENSITY, BRIGHTNESS);
   send(REG_SHUTDOWN, 1);
 
-  randomSeed(analogRead(A0));   // неподключённый вход - источник случайности
-  pickLevel();
+  bus.begin(ModuleBus::LABYRINTH, ModuleBus::LABYRINTH_ADDRESS);
+  draw(millis());
+  Serial.println(F("WAITING_FOR_COMMAND: I2C 0x12, SDA=A4 SCL=A5"));
 }
 
 void loop() {
   uint32_t now = millis();
+  PuzzleI2c::Action action = bus.update();
+  if (action == PuzzleI2c::NEW_GAME) pickLevel();
+  else if (action == PuzzleI2c::HALT) {
+    gameActive = false;
+    digitalWrite(PIN_LED_EASY, LOW); digitalWrite(PIN_LED_MEDIUM, LOW); digitalWrite(PIN_LED_HARD, LOW);
+    digitalWrite(PIN_ALERT_LED, LOW);
+  }
+  if (!gameActive) { draw(now); return; }
   int8_t key = scanKey();
 
   if (key != lastKey) {
