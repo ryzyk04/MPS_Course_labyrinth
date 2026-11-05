@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include "../../shared/puzzle_i2c.h"
+#include "puzzle_i2c.h"
 
 // Временная общая I2C-шина через Uno wires: A4=SDA, A5=SCL, адрес 0x12.
 PuzzleI2c bus;
